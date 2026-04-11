@@ -40,18 +40,51 @@ RESET  = "\033[0m"
 # ─────────────────────────────────────────────────────────────
 # Fake executable creation
 # ─────────────────────────────────────────────────────────────
-# Strategy: copy cmd.exe (a real Windows binary) to the target path.
-# When launched, the PROCESS NAME will be e.g. "uagame.exe" — which
-# is exactly what Discord checks. We pass it a ping command so it
-# sleeps silently for the required duration without touching stdin.
+# Strategy: copy pythonw.exe under the game's exe name, then run it
+# with a small tkinter helper script that shows a real GUI window.
+#
+# WHY pythonw.exe?
+#   - cmd.exe / notepad.exe on Win11 are either console apps (subsystem 3)
+#     or Store stubs that exit immediately.
+#   - pythonw.exe is a genuine Windows GUI application (subsystem 2).
+#   - It is guaranteed to exist because this script is already running Python.
+#   - When renamed to uagame.exe, Task Manager and Discord both see that name.
+#   - Passing it a .pyw helper keeps a real window open for Discord to track.
 
-def find_system_exe() -> Path:
-    """Return the path to cmd.exe (always present on Windows)."""
-    windir = Path(os.environ.get("WINDIR", r"C:\Windows"))
-    candidate = windir / "System32" / "cmd.exe"
-    if candidate.exists():
-        return candidate
-    raise FileNotFoundError("cmd.exe not found — this is very unexpected.")
+def find_pythonw() -> Path:
+    """Return the path to pythonw.exe next to the current Python interpreter."""
+    pythonw = Path(sys.executable).parent / "pythonw.exe"
+    if pythonw.exists():
+        return pythonw
+    raise FileNotFoundError(
+        f"pythonw.exe not found next to {sys.executable}. "
+        "Please reinstall Python."
+    )
+
+
+def create_quest_window_script(script_path: Path, game_name: str, duration_min: int) -> None:
+    """Write a minimal tkinter script that shows a 'Quest in progress' window."""
+    # Escape the game name for embedding in a Python string literal
+    safe_name = game_name.replace("\\", "\\\\").replace('"', '\\"')
+    script_path.write_text(
+        f'import tkinter as tk\n'
+        f'root = tk.Tk()\n'
+        f'root.title("{safe_name}")\n'
+        f'root.geometry("440x180")\n'
+        f'root.resizable(False, False)\n'
+        f'root.configure(bg="#1e1e2e")\n'
+        f'tk.Label(root, text="\U0001f3ae  {safe_name}",\n'
+        f'         font=("Segoe UI", 14, "bold"),\n'
+        f'         bg="#1e1e2e", fg="#cdd6f4").pack(pady=(30, 8))\n'
+        f'tk.Label(root,\n'
+        f'         text="Discord Quest in progress — do not close this window.",\n'
+        f'         font=("Segoe UI", 10), bg="#1e1e2e", fg="#a6adc8").pack()\n'
+        f'tk.Label(root,\n'
+        f'         text="Running for {duration_min} minute(s).",\n'
+        f'         font=("Segoe UI", 9), bg="#1e1e2e", fg="#6c7086").pack(pady=(6,0))\n'
+        f'root.mainloop()\n',
+        encoding="utf-8",
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -147,9 +180,9 @@ def resolve_exe_path(raw_name: str, base_dir: Path) -> Path:
 
 
 def create_fake_exe(exe_path: Path) -> bool:
-    """Copy cmd.exe to the target path (and create any needed directories)."""
+    """Copy pythonw.exe to the target path (creates any needed directories)."""
     try:
-        src = find_system_exe()
+        src = find_pythonw()
         exe_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, exe_path)
         print_ok(f"Created: {exe_path}  (copied from {src})")
@@ -254,12 +287,18 @@ def main():
 
     exe_path = resolve_exe_path(chosen_exe, base_dir)
 
-    # ── Step 7: create file ──────────────────────────────────
+    # ── Step 7: create file + helper script ─────────────────
     print()
     print_step("🔨", f"Creating {exe_path.name} …")
     if not create_fake_exe(exe_path):
         shutil.rmtree(base_dir, ignore_errors=True)
         sys.exit(1)
+
+    # Write the tkinter window script that pythonw will run
+    helper_script = base_dir / "_quest_helper.pyw"
+    game_display_name = chosen.get("name", exe_path.stem)
+    create_quest_window_script(helper_script, game_display_name, duration_min)
+    print_ok(f"Created helper script: {helper_script.name}")
 
     # ── Step 8: run ──────────────────────────────────────────
     quest_seconds = duration_min * 60           # what the user asked for
@@ -278,19 +317,16 @@ def main():
 
     proc = None
     try:
-        # Strategy: run the fake exe (which is cmd.exe renamed) with a ping
-        # command. "ping -n N 127.0.0.1" sends N packets with 1-second gaps,
-        # giving us ~N seconds of sleep without touching stdin at all.
-        # CREATE_NO_WINDOW keeps the process fully invisible.
-        ping_count = total_seconds + 1  # N packets → N-1 seconds; +1 gives exactly N seconds
+        # Launch: <game>.exe (= pythonw.exe renamed) _quest_helper.pyw
+        # pythonw.exe is a real GUI app (PE subsystem = 2), so Discord
+        # recognises it as a game process. The helper script opens a
+        # small window that stays open until we kill the process.
         proc = subprocess.Popen(
-            [str(exe_path), "/c", f"ping -n {ping_count} 127.0.0.1"],
+            [str(exe_path), str(helper_script)],
             cwd=str(base_dir),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW,
         )
         print_ok(f"PID: {proc.pid}")
+        print_warn("A small game window will open — do NOT close it until the timer finishes.")
 
         # Progress bar tracks only the quest portion (quest_seconds).
         # The buffer at the start is silent — Discord detects the process then.
