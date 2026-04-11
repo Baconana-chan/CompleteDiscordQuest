@@ -62,29 +62,67 @@ def find_pythonw() -> Path:
     )
 
 
-def create_quest_window_script(script_path: Path, game_name: str, duration_min: int) -> None:
-    """Write a minimal tkinter script that shows a 'Quest in progress' window."""
-    # Escape the game name for embedding in a Python string literal
+def create_quest_window_script(script_path: Path, game_name: str, total_seconds: int) -> None:
+    """Write a tkinter script with a live progress bar for the quest window."""
     safe_name = game_name.replace("\\", "\\\\").replace('"', '\\"')
-    script_path.write_text(
-        f'import tkinter as tk\n'
-        f'root = tk.Tk()\n'
-        f'root.title("{safe_name}")\n'
-        f'root.geometry("440x180")\n'
-        f'root.resizable(False, False)\n'
-        f'root.configure(bg="#1e1e2e")\n'
-        f'tk.Label(root, text="\U0001f3ae  {safe_name}",\n'
-        f'         font=("Segoe UI", 14, "bold"),\n'
-        f'         bg="#1e1e2e", fg="#cdd6f4").pack(pady=(30, 8))\n'
-        f'tk.Label(root,\n'
-        f'         text="Discord Quest in progress — do not close this window.",\n'
-        f'         font=("Segoe UI", 10), bg="#1e1e2e", fg="#a6adc8").pack()\n'
-        f'tk.Label(root,\n'
-        f'         text="Running for {duration_min} minute(s).",\n'
-        f'         font=("Segoe UI", 9), bg="#1e1e2e", fg="#6c7086").pack(pady=(6,0))\n'
-        f'root.mainloop()\n',
-        encoding="utf-8",
-    )
+    # Build the helper as a list of lines to avoid f-string brace-escaping chaos.
+    lines = [
+        "import sys, time, tkinter as tk",
+        "from tkinter import ttk",
+        "",
+        f"total = int(sys.argv[1]) if len(sys.argv) > 1 else {total_seconds}",
+        "start = time.time()",
+        "",
+        "root = tk.Tk()",
+        f'root.title("{safe_name}")',
+        'root.geometry("460x230")',
+        "root.resizable(False, False)",
+        'root.configure(bg="#1e1e2e")',
+        "",
+        # Title label with game controller emoji + game name
+        'tk.Label(root, text="\U0001f3ae  ' + safe_name + '",',
+        '         font=("Segoe UI", 13, "bold"),',
+        '         bg="#1e1e2e", fg="#cdd6f4").pack(pady=(22, 4))',
+        "",
+        # Subtitle
+        'tk.Label(root, text="Discord Quest in progress \u2014 do not close this window.",',
+        '         font=("Segoe UI", 9), bg="#1e1e2e", fg="#a6adc8").pack()',
+        "",
+        # Progress bar styling
+        "st = ttk.Style()",
+        'st.theme_use("default")',
+        'st.configure("Q.Horizontal.TProgressbar",',
+        '             background="#89b4fa", troughcolor="#313244",',
+        '             borderwidth=0, thickness=14)',
+        "",
+        'frm = tk.Frame(root, bg="#1e1e2e")',
+        'frm.pack(fill="x", padx=32, pady=(16, 4))',
+        'pb = ttk.Progressbar(frm, style="Q.Horizontal.TProgressbar",',
+        '                     orient="horizontal", length=396,',
+        '                     mode="determinate", maximum=total)',
+        "pb.pack()",
+        "",
+        # Time remaining label
+        'tv = tk.StringVar(value="starting \u2026")',
+        'tk.Label(root, textvariable=tv, font=("Segoe UI", 9),',
+        '         bg="#1e1e2e", fg="#6c7086").pack(pady=(5, 0))',
+        "",
+        # Update loop
+        "def tick():",
+        "    elapsed = time.time() - start",
+        "    rem = max(0, total - elapsed)",
+        '    pb["value"] = min(elapsed, total)',
+        "    m, s = divmod(int(rem), 60)",
+        '    tv.set(f"{m:02d}:{s:02d} remaining")',
+        "    if rem > 0:",
+        "        root.after(500, tick)",
+        "    else:",
+        '        tv.set("Done! You may close this window.")',
+        "",
+        "root.after(500, tick)",
+        "root.mainloop()",
+    ]
+    script_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -287,23 +325,23 @@ def main():
 
     exe_path = resolve_exe_path(chosen_exe, base_dir)
 
-    # ── Step 7: create file + helper script ─────────────────
+    # ── Step 7: create file ──────────────────────────────────
     print()
     print_step("🔨", f"Creating {exe_path.name} …")
     if not create_fake_exe(exe_path):
         shutil.rmtree(base_dir, ignore_errors=True)
         sys.exit(1)
 
-    # Write the tkinter window script that pythonw will run
-    helper_script = base_dir / "_quest_helper.pyw"
-    game_display_name = chosen.get("name", exe_path.stem)
-    create_quest_window_script(helper_script, game_display_name, duration_min)
-    print_ok(f"Created helper script: {helper_script.name}")
-
     # ── Step 8: run ──────────────────────────────────────────
     quest_seconds = duration_min * 60           # what the user asked for
     total_seconds = quest_seconds + DISCORD_DETECT_BUFFER  # includes detection buffer
     deadline = datetime.now() + timedelta(seconds=total_seconds)
+
+    # Write the tkinter window script (needs total_seconds, so created after)
+    helper_script = base_dir / "_quest_helper.pyw"
+    game_display_name = chosen.get("name", exe_path.stem)
+    create_quest_window_script(helper_script, game_display_name, total_seconds)
+    print_ok(f"Created helper script: {helper_script.name}")
 
     print()
     print_step(
@@ -322,7 +360,7 @@ def main():
         # recognises it as a game process. The helper script opens a
         # small window that stays open until we kill the process.
         proc = subprocess.Popen(
-            [str(exe_path), str(helper_script)],
+            [str(exe_path), str(helper_script), str(total_seconds)],
             cwd=str(base_dir),
         )
         print_ok(f"PID: {proc.pid}")
