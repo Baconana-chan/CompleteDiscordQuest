@@ -62,33 +62,35 @@ def find_pythonw() -> Path:
     )
 
 
-def create_quest_window_script(script_path: Path, game_name: str, total_seconds: int) -> None:
-    """Write a tkinter script with a live progress bar for the quest window."""
+def create_quest_window_script(
+    script_path: Path, game_name: str, total_seconds: int, signal_file: Path
+) -> None:
+    """Write a tkinter script with a live progress bar and +/-30s buttons."""
     safe_name = game_name.replace("\\", "\\\\").replace('"', '\\"')
-    # Build the helper as a list of lines to avoid f-string brace-escaping chaos.
+    sig = signal_file.as_posix().replace("\\", "/")
     lines = [
         "import sys, time, tkinter as tk",
         "from tkinter import ttk",
+        "from pathlib import Path",
         "",
-        f"total = int(sys.argv[1]) if len(sys.argv) > 1 else {total_seconds}",
+        f"total_init = int(sys.argv[1]) if len(sys.argv) > 1 else {total_seconds}",
+        f'sig = Path(r"{signal_file}")',
         "start = time.time()",
+        "state = {'extra': 0}",
         "",
         "root = tk.Tk()",
         f'root.title("{safe_name}")',
-        'root.geometry("460x230")',
+        'root.geometry("460x270")',
         "root.resizable(False, False)",
         'root.configure(bg="#1e1e2e")',
         "",
-        # Title label with game controller emoji + game name
         'tk.Label(root, text="\U0001f3ae  ' + safe_name + '",',
         '         font=("Segoe UI", 13, "bold"),',
-        '         bg="#1e1e2e", fg="#cdd6f4").pack(pady=(22, 4))',
+        '         bg="#1e1e2e", fg="#cdd6f4").pack(pady=(20, 4))',
         "",
-        # Subtitle
         'tk.Label(root, text="Discord Quest in progress \u2014 do not close this window.",',
         '         font=("Segoe UI", 9), bg="#1e1e2e", fg="#a6adc8").pack()',
         "",
-        # Progress bar styling
         "st = ttk.Style()",
         'st.theme_use("default")',
         'st.configure("Q.Horizontal.TProgressbar",',
@@ -96,28 +98,64 @@ def create_quest_window_script(script_path: Path, game_name: str, total_seconds:
         '             borderwidth=0, thickness=14)',
         "",
         'frm = tk.Frame(root, bg="#1e1e2e")',
-        'frm.pack(fill="x", padx=32, pady=(16, 4))',
+        'frm.pack(fill="x", padx=32, pady=(14, 2))',
         'pb = ttk.Progressbar(frm, style="Q.Horizontal.TProgressbar",',
         '                     orient="horizontal", length=396,',
-        '                     mode="determinate", maximum=total)',
+        '                     mode="determinate", maximum=total_init)',
         "pb.pack()",
         "",
-        # Time remaining label
         'tv = tk.StringVar(value="starting \u2026")',
         'tk.Label(root, textvariable=tv, font=("Segoe UI", 9),',
-        '         bg="#1e1e2e", fg="#6c7086").pack(pady=(5, 0))',
+        '         bg="#1e1e2e", fg="#6c7086").pack(pady=(4, 0))',
         "",
-        # Update loop
+        # ── +/- buttons ───────────────────────────────────────
+        'bf = tk.Frame(root, bg="#1e1e2e")',
+        'bf.pack(pady=(10, 0))',
+        "",
+        "def effective():",
+        "    return total_init + state['extra']",
+        "",
+        "def add_time():",
+        "    state['extra'] += 30",
+        "    pb['maximum'] = effective()",
+        "    try: sig.write_text('+30')",
+        "    except Exception: pass",
+        "",
+        "def sub_time():",
+        "    elapsed = time.time() - start",
+        "    if effective() - elapsed > 35:",
+        "        state['extra'] -= 30",
+        "        pb['maximum'] = effective()",
+        "        try: sig.write_text('-30')",
+        "        except Exception: pass",
+        "",
+        'btn_minus = tk.Button(bf, text="\u2212 30s", command=sub_time,',
+        '    font=("Segoe UI", 9, "bold"), bg="#45475a", fg="#f38ba8",',
+        '    activebackground="#313244", activeforeground="#f38ba8",',
+        '    relief="flat", padx=14, pady=5, cursor="hand2", bd=0)',
+        'btn_minus.pack(side="left", padx=(0, 8))',
+        "",
+        'btn_plus = tk.Button(bf, text="+ 30s", command=add_time,',
+        '    font=("Segoe UI", 9, "bold"), bg="#45475a", fg="#a6e3a1",',
+        '    activebackground="#313244", activeforeground="#a6e3a1",',
+        '    relief="flat", padx=14, pady=5, cursor="hand2", bd=0)',
+        'btn_plus.pack(side="left")',
+        "",
+        # ── tick loop ─────────────────────────────────────────
         "def tick():",
         "    elapsed = time.time() - start",
-        "    rem = max(0, total - elapsed)",
-        '    pb["value"] = min(elapsed, total)',
+        "    et = effective()",
+        "    rem = max(0, et - elapsed)",
+        "    pb['maximum'] = et",
+        "    pb['value'] = min(elapsed, et)",
         "    m, s = divmod(int(rem), 60)",
         '    tv.set(f"{m:02d}:{s:02d} remaining")',
         "    if rem > 0:",
         "        root.after(500, tick)",
         "    else:",
         '        tv.set("Done! You may close this window.")',
+        "        btn_plus.config(state='disabled')",
+        "        btn_minus.config(state='disabled')",
         "",
         "root.after(500, tick)",
         "root.mainloop()",
@@ -337,10 +375,11 @@ def main():
     total_seconds = quest_seconds + DISCORD_DETECT_BUFFER  # includes detection buffer
     deadline = datetime.now() + timedelta(seconds=total_seconds)
 
-    # Write the tkinter window script (needs total_seconds, so created after)
+    # Write the tkinter window script (needs total_seconds + signal file path)
     helper_script = base_dir / "_quest_helper.pyw"
+    signal_file   = base_dir / "_adjust.txt"
     game_display_name = chosen.get("name", exe_path.stem)
-    create_quest_window_script(helper_script, game_display_name, total_seconds)
+    create_quest_window_script(helper_script, game_display_name, total_seconds, signal_file)
     print_ok(f"Created helper script: {helper_script.name}")
 
     print()
@@ -365,6 +404,7 @@ def main():
         )
         print_ok(f"PID: {proc.pid}")
         print_warn("A small game window will open — do NOT close it until the timer finishes.")
+        print_warn("Use the  + 30s / − 30s  buttons in the window to adjust time if needed.")
 
         # Progress bar tracks only the quest portion (quest_seconds).
         # The buffer at the start is silent — Discord detects the process then.
@@ -396,6 +436,19 @@ def main():
                     end="",
                     flush=True,
                 )
+            # Check if the window buttons requested a time adjustment
+            if signal_file.exists():
+                try:
+                    adj = int(signal_file.read_text().strip())
+                    signal_file.unlink()
+                    total_seconds  += adj
+                    quest_seconds  += adj
+                    sign = f"+{adj}s" if adj > 0 else f"{adj}s"
+                    print(f"\n  {CYAN}⏱  Time adjusted: {sign}  "
+                          f"(new total: {format_seconds(max(0, total_seconds - elapsed))}){RESET}")
+                except Exception:
+                    pass
+
             if proc.poll() is not None:
                 print()
                 print_warn("Process exited early (unexpected).")
