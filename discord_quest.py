@@ -17,13 +17,20 @@ import shutil
 import tempfile
 import subprocess
 import urllib.request
-from pathlib import Path
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 
 # ─────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────
-DISCORD_API           = "https://discord.com/api/v8/applications/detectable"
+DISCORD_API           = "https://discord.com/api/v10/applications/detectable"
 DEFAULT_DURATION      = 15          # minutes
 POLL_INTERVAL         = 5           # seconds between status updates
 DISCORD_DETECT_BUFFER = 30          # extra seconds added so Discord detects the process before the quest timer starts
@@ -169,7 +176,7 @@ def create_quest_window_script(
 def print_banner():
     print(f"""
 {CYAN}{BOLD}╔══════════════════════════════════════════════╗
-║     Discord Quest Completer  v1.0            ║
+║     Discord Quest Completer  v1.1            ║
 ║     by Baconana-chan                         ║
 ╚══════════════════════════════════════════════╝{RESET}
 """)
@@ -279,6 +286,314 @@ def kill_process(proc: subprocess.Popen):
             pass
 
 
+@dataclass
+class QuestRun:
+    name: str
+    exe_name: str
+    base_dir: Path
+    proc: subprocess.Popen
+    quest_seconds: int
+    total_seconds: int
+    started_at: float
+    signal_file: Path
+    completed: bool = False
+    early_exit: bool = False
+    finished: bool = False
+    ended_at: float = 0.0
+
+    @property
+    def elapsed(self) -> float:
+        end = self.ended_at or time.monotonic()
+        return end - self.started_at
+
+    def read_signal(self, elapsed: float) -> None:
+        if not self.signal_file.exists():
+            return
+        try:
+            adj = int(self.signal_file.read_text(encoding="utf-8").strip())
+            self.signal_file.unlink()
+            self.total_seconds += adj
+            self.quest_seconds += adj
+            sign = f"+{adj}s" if adj > 0 else f"{adj}s"
+            print(
+                f"\n  {CYAN}⏱  {self.name}: time adjusted: {sign}  "
+                f"(new remaining: {format_seconds(max(0, int(self.total_seconds - elapsed)))}){RESET}"
+            )
+        except Exception:
+            pass
+
+    def update(self) -> None:
+        if self.finished:
+            return
+
+        now = time.monotonic()
+        self.ended_at = now
+        elapsed = now - self.started_at
+        self.read_signal(elapsed)
+
+        if self.proc.poll() is not None:
+            self.finished = True
+            if elapsed < self.total_seconds - 1:
+                self.early_exit = True
+            return
+
+        if elapsed >= self.total_seconds:
+            kill_process(self.proc)
+            self.finished = True
+            self.completed = True
+            return
+
+        self.ended_at = 0.0
+
+    def cleanup(self) -> None:
+        if self.proc.poll() is None:
+            kill_process(self.proc)
+        shutil.rmtree(self.base_dir, ignore_errors=True)
+
+
+def print_session_help():
+    print(f"  {DIM}Controls: A add game, S status, Q stop all and quit, Ctrl+C stop all.{RESET}")
+
+
+def read_console_key(timeout: float) -> Optional[str]:
+    if msvcrt is None:
+        time.sleep(timeout)
+        return None
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if msvcrt.kbhit():
+            ch = msvcrt.getwche()
+            if ch in ("\x00", "\xe0"):
+                msvcrt.getwche()
+                continue
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            return ch
+        time.sleep(0.2)
+    return None
+
+
+def render_run(run: QuestRun, index: int) -> str:
+    elapsed = run.elapsed
+
+    if run.completed:
+        return f"{index}. {run.name} {GREEN}done{RESET} ({format_seconds(int(elapsed))})"
+
+    if run.early_exit or run.proc.poll() is not None:
+        return f"{index}. {run.name} {RED}stopped early{RESET}"
+
+    if elapsed <= DISCORD_DETECT_BUFFER:
+        pct = int(min(100, elapsed / DISCORD_DETECT_BUFFER * 100))
+        return (
+            f"{index}. {run.name} {YELLOW}waiting for Discord{RESET} {pct:3d}%  "
+            f"PID {run.proc.pid}"
+        )
+
+    quest_elapsed = elapsed - DISCORD_DETECT_BUFFER
+    quest_remaining = run.quest_seconds - quest_elapsed
+    pct = int(quest_elapsed / run.quest_seconds * 100)
+    bar_len = int(quest_elapsed / run.quest_seconds * 30)
+    bar = "█" * max(0, min(30, bar_len)) + "░" * (30 - max(0, min(30, bar_len)))
+    return (
+        f"{index}. {run.name} {GREEN}{bar}{RESET} {pct:3d}%  "
+        f"remaining {YELLOW}{format_seconds(max(0, int(quest_remaining)))}{RESET}  "
+        f"PID {run.proc.pid}"
+    )
+
+
+def print_active_status(active: list[QuestRun]) -> None:
+    print(f"\n  {BOLD}Active quests:{RESET}")
+    for i, run in enumerate(active, 1):
+        print(f"    {render_run(run, i)}")
+
+
+def cleanup_finished(active: list[QuestRun]) -> list[QuestRun]:
+    remaining = []
+    for run in active:
+        run.update()
+        if run.finished:
+            print()
+            if run.completed:
+                print_ok(f"{run.name}: quest time finished.")
+            else:
+                print_warn(f"{run.name}: process exited early.")
+            run.cleanup()
+        else:
+            remaining.append(run)
+    return remaining
+
+
+def stop_all(active: list[QuestRun]) -> None:
+    for run in active:
+        print_step("⏹", f"Stopping {run.name} …")
+        run.cleanup()
+    print_ok("All active quests stopped.")
+
+
+def add_quest(apps: list[dict]) -> Optional[QuestRun]:
+    print(f"\n  {BOLD}Add a new quest:{RESET}")
+
+    while True:
+        print()
+        query = input(f"  {BOLD}🔍 Enter game name (or part of it): {RESET}").strip()
+        if not query:
+            continue
+        results = search_games(apps, query)
+        if not results:
+            print_warn("No games found. Try a different search term.")
+            continue
+        break
+
+    print(f"\n  Found {len(results)} game(s):\n")
+    game_names = [r.get("name", "<unnamed>") for r in results]
+    game_idx = pick_from_list(game_names, "Select game [number]:")
+    chosen = results[game_idx]
+    print_ok(f"Selected: {BOLD}{chosen.get('name')}{RESET}")
+
+    exe_paths = get_exe_paths(chosen)
+    if not exe_paths:
+        print_warn("No .exe paths found in the API data.")
+        custom = input(f"  {BOLD}Enter the .exe name manually: {RESET}").strip()
+        if not custom:
+            print_err("No name entered.")
+            return None
+        exe_paths = [custom]
+
+    print(f"\n  Available executables:\n")
+    exe_idx = pick_from_list(exe_paths, "Select .exe [number]:")
+    chosen_exe = exe_paths[exe_idx]
+    print_ok(f"Selected: {BOLD}{chosen_exe}{RESET}")
+
+    print()
+    dur_raw = input(
+        f"  {BOLD}⏱  How many minutes to run? [{DEFAULT_DURATION}]: {RESET}"
+    ).strip()
+    try:
+        duration_min = int(dur_raw) if dur_raw else DEFAULT_DURATION
+        if duration_min <= 0:
+            raise ValueError
+    except ValueError:
+        print_warn(f"Invalid value, using default of {DEFAULT_DURATION} min.")
+        duration_min = DEFAULT_DURATION
+
+    base_dir = Path(tempfile.mkdtemp(prefix="discord_quest_"))
+    print_ok(f"Working folder: {base_dir}")
+
+    exe_path = resolve_exe_path(chosen_exe, base_dir)
+
+    print()
+    print_step("🔨", f"Creating {exe_path.name} …")
+    if not create_fake_exe(exe_path):
+        shutil.rmtree(base_dir, ignore_errors=True)
+        return None
+
+    quest_seconds = duration_min * 60
+    total_seconds = quest_seconds + DISCORD_DETECT_BUFFER
+    deadline = datetime.now() + timedelta(seconds=total_seconds)
+
+    helper_script = base_dir / "_quest_helper.pyw"
+    signal_file = base_dir / "_adjust.txt"
+    game_display_name = chosen.get("name", exe_path.stem)
+    create_quest_window_script(helper_script, game_display_name, total_seconds, signal_file)
+    print_ok(f"Created helper script: {helper_script.name}")
+
+    print()
+    print_step(
+        "▶",
+        f"Running {BOLD}{exe_path.name}{RESET} "
+        f"for {BOLD}{duration_min}{RESET} min "
+        f"(+{DISCORD_DETECT_BUFFER}s buffer, until {deadline.strftime('%H:%M:%S')})",
+    )
+    print_warn(f"Discord will have {DISCORD_DETECT_BUFFER}s to detect the process before the quest timer starts.")
+
+    try:
+        proc = subprocess.Popen(
+            [str(exe_path), str(helper_script), str(total_seconds)],
+            cwd=str(base_dir),
+        )
+    except Exception as e:
+        print_err(f"Failed to start quest: {e}")
+        shutil.rmtree(base_dir, ignore_errors=True)
+        return None
+
+    print_ok(f"PID: {proc.pid}")
+    print_warn("A small game window will open — do NOT close it until the timer finishes.")
+    print_warn("Use the  + 30s / − 30s  buttons in the window to adjust time if needed.")
+
+    return QuestRun(
+        name=game_display_name,
+        exe_name=exe_path.name,
+        base_dir=base_dir,
+        proc=proc,
+        quest_seconds=quest_seconds,
+        total_seconds=total_seconds,
+        started_at=time.monotonic(),
+        signal_file=signal_file,
+    )
+
+
+def run_session(apps: list[dict]) -> None:
+    active: list[QuestRun] = []
+    print_session_help()
+
+    try:
+        while True:
+            active = cleanup_finished(active)
+
+            if not active:
+                print(f"\n  {DIM}No active quests. Press A to add a game, Q to quit.{RESET}")
+                while True:
+                    key = read_console_key(0.2)
+                    if key is None:
+                        continue
+                    key = key.lower()
+                    if key == "a":
+                        run = add_quest(apps)
+                        if run:
+                            active.append(run)
+                            print_ok("Quest added. Monitoring active quests …")
+                        break
+                    if key == "q":
+                        print_warn("Nothing to stop. Exiting.")
+                        return
+                    if key in ("s", "h", "?"):
+                        print_session_help()
+                    else:
+                        print(f"  {DIM}Press A to add a game, Q to quit.{RESET}")
+                continue
+
+            print_active_status(active)
+            print_session_help()
+            key = read_console_key(POLL_INTERVAL)
+
+            if key is None:
+                continue
+
+            key = key.lower()
+            if key == "a":
+                run = add_quest(apps)
+                if run:
+                    active.append(run)
+                    print_ok("Quest added. Monitoring active quests …")
+            elif key == "s":
+                print_active_status(active)
+            elif key in ("q", "x"):
+                answer = input(f"\n  Stop {len(active)} active quest(s) and exit? [y/N]: ").strip().lower()
+                if answer in ("y", "yes", "д", "да"):
+                    stop_all(active)
+                    return
+                print_warn("Continuing active quests.")
+            elif key in ("h", "?"):
+                print_session_help()
+            else:
+                print_warn("Unknown key. Press A to add a game, S for status, or Q to stop all.")
+
+    except KeyboardInterrupt:
+        print(f"\n\n  {YELLOW}Stopped by user.{RESET}")
+        stop_all(active)
+
+
 # ─────────────────────────────────────────────────────────────
 # Interactive selection helpers
 # ─────────────────────────────────────────────────────────────
@@ -303,170 +618,13 @@ def pick_from_list(items: list, prompt: str) -> int:
 def main():
     print_banner()
 
-    # ── Step 1: fetch apps ───────────────────────────────────
     try:
         apps = fetch_detectable()
     except Exception as e:
         print_err(f"Failed to fetch game list: {e}")
         sys.exit(1)
 
-    # ── Step 2: search ───────────────────────────────────────
-    while True:
-        print()
-        query = input(f"  {BOLD}🔍 Enter game name (or part of it): {RESET}").strip()
-        if not query:
-            continue
-        results = search_games(apps, query)
-        if not results:
-            print_warn("No games found. Try a different search term.")
-            continue
-        break
-
-    # ── Step 3: pick game ────────────────────────────────────
-    print(f"\n  Found {len(results)} game(s):\n")
-    game_names = [r.get("name", "<unnamed>") for r in results]
-    game_idx = pick_from_list(game_names, "Select game [number]:")
-    chosen = results[game_idx]
-    print_ok(f"Selected: {BOLD}{chosen.get('name')}{RESET}")
-
-    # ── Step 4: pick exe ─────────────────────────────────────
-    exe_paths = get_exe_paths(chosen)
-    if not exe_paths:
-        print_warn("No .exe paths found in the API data.")
-        custom = input(f"  {BOLD}Enter the .exe name manually: {RESET}").strip()
-        if not custom:
-            print_err("No name entered, exiting.")
-            sys.exit(1)
-        exe_paths = [custom]
-
-    print(f"\n  Available executables:\n")
-    exe_idx = pick_from_list(exe_paths, "Select .exe [number]:")
-    chosen_exe = exe_paths[exe_idx]
-    print_ok(f"Selected: {BOLD}{chosen_exe}{RESET}")
-
-    # ── Step 5: duration ─────────────────────────────────────
-    print()
-    dur_raw = input(
-        f"  {BOLD}⏱  How many minutes to run? [{DEFAULT_DURATION}]: {RESET}"
-    ).strip()
-    try:
-        duration_min = int(dur_raw) if dur_raw else DEFAULT_DURATION
-        if duration_min <= 0:
-            raise ValueError
-    except ValueError:
-        print_warn(f"Invalid value, using default of {DEFAULT_DURATION} min.")
-        duration_min = DEFAULT_DURATION
-
-    # ── Step 6: working directory ────────────────────────────
-    base_dir = Path(tempfile.mkdtemp(prefix="discord_quest_"))
-    print_ok(f"Working folder: {base_dir}")
-
-    exe_path = resolve_exe_path(chosen_exe, base_dir)
-
-    # ── Step 7: create file ──────────────────────────────────
-    print()
-    print_step("🔨", f"Creating {exe_path.name} …")
-    if not create_fake_exe(exe_path):
-        shutil.rmtree(base_dir, ignore_errors=True)
-        sys.exit(1)
-
-    # ── Step 8: run ──────────────────────────────────────────
-    quest_seconds = duration_min * 60           # what the user asked for
-    total_seconds = quest_seconds + DISCORD_DETECT_BUFFER  # includes detection buffer
-    deadline = datetime.now() + timedelta(seconds=total_seconds)
-
-    # Write the tkinter window script (needs total_seconds + signal file path)
-    helper_script = base_dir / "_quest_helper.pyw"
-    signal_file   = base_dir / "_adjust.txt"
-    game_display_name = chosen.get("name", exe_path.stem)
-    create_quest_window_script(helper_script, game_display_name, total_seconds, signal_file)
-    print_ok(f"Created helper script: {helper_script.name}")
-
-    print()
-    print_step(
-        "▶",
-        f"Running {BOLD}{exe_path.name}{RESET} "
-        f"for {BOLD}{duration_min}{RESET} min "
-        f"(+{DISCORD_DETECT_BUFFER}s buffer, until {deadline.strftime('%H:%M:%S')})",
-    )
-    print_warn(f"Discord will have {DISCORD_DETECT_BUFFER}s to detect the process before the quest timer starts.")
-    print(f"  {DIM}Press Ctrl+C to stop early.{RESET}\n")
-
-    proc = None
-    try:
-        # Launch: <game>.exe (= pythonw.exe renamed) _quest_helper.pyw
-        # pythonw.exe is a real GUI app (PE subsystem = 2), so Discord
-        # recognises it as a game process. The helper script opens a
-        # small window that stays open until we kill the process.
-        proc = subprocess.Popen(
-            [str(exe_path), str(helper_script), str(total_seconds)],
-            cwd=str(base_dir),
-        )
-        print_ok(f"PID: {proc.pid}")
-        print_warn("A small game window will open — do NOT close it until the timer finishes.")
-        print_warn("Use the  + 30s / − 30s  buttons in the window to adjust time if needed.")
-
-        # Progress bar tracks only the quest portion (quest_seconds).
-        # The buffer at the start is silent — Discord detects the process then.
-        elapsed = 0
-        while elapsed < total_seconds:
-            time.sleep(POLL_INTERVAL)
-            elapsed += POLL_INTERVAL
-            remaining = total_seconds - elapsed
-
-            # During the buffer phase show a "waiting for Discord" indicator
-            if elapsed <= DISCORD_DETECT_BUFFER:
-                detecting_pct = int(elapsed / DISCORD_DETECT_BUFFER * 100)
-                print(
-                    f"\r  {YELLOW}Waiting for Discord to detect …{RESET} "
-                    f"{CYAN}{detecting_pct}%{RESET}   ",
-                    end="",
-                    flush=True,
-                )
-            else:
-                # Progress relative to the quest portion only
-                quest_elapsed = elapsed - DISCORD_DETECT_BUFFER
-                quest_remaining = quest_seconds - quest_elapsed
-                pct = int(quest_elapsed / quest_seconds * 30)
-                bar = "█" * pct + "░" * (30 - pct)
-                pct_num = int(quest_elapsed / quest_seconds * 100)
-                print(
-                    f"\r  {GREEN}{bar}{RESET} {pct_num:3d}%  "
-                    f"remaining {YELLOW}{format_seconds(max(0, quest_remaining))}{RESET}   ",
-                    end="",
-                    flush=True,
-                )
-            # Check if the window buttons requested a time adjustment
-            if signal_file.exists():
-                try:
-                    adj = int(signal_file.read_text().strip())
-                    signal_file.unlink()
-                    total_seconds  += adj
-                    quest_seconds  += adj
-                    sign = f"+{adj}s" if adj > 0 else f"{adj}s"
-                    print(f"\n  {CYAN}⏱  Time adjusted: {sign}  "
-                          f"(new total: {format_seconds(max(0, total_seconds - elapsed))}){RESET}")
-                except Exception:
-                    pass
-
-            if proc.poll() is not None:
-                print()
-                print_warn("Process exited early (unexpected).")
-                break
-
-        print()
-
-    except KeyboardInterrupt:
-        print(f"\n\n  {YELLOW}Stopped by user.{RESET}")
-    finally:
-        if proc and proc.poll() is None:
-            print_step("⏹", "Stopping process …")
-            kill_process(proc)
-            print_ok("Process stopped.")
-        # cleanup
-        print_step("🗑", "Removing temporary folder …")
-        shutil.rmtree(base_dir, ignore_errors=True)
-        print_ok("Done! The quest should register in Discord.")
+    run_session(apps)
 
 
 if __name__ == "__main__":
