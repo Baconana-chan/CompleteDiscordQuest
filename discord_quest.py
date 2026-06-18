@@ -414,31 +414,98 @@ def create_extra_files(base_dir: Path) -> bool:
             return True
 
 
-def create_fake_exe(exe_path: Path) -> bool:
-    """Copy pythonw.exe to the target path (creates any needed directories)."""
+def _elevated_copy_file(src: Path, dst: Path) -> bool:
+    """Copy a file via elevated cmd.exe (bypasses access denied)."""
+    bat = tempfile.NamedTemporaryFile(mode="w", suffix=".bat", delete=False, encoding="utf-8")
+    bat.write(
+        '@echo off\n'
+        f'copy /y "{src}" "{dst}" >nul\n'
+        f'del /f /q "%~f0" >nul 2>&1\n'
+    )
+    bat_path = bat.name
+    bat.close()
     try:
-        src = find_pythonw()
-        exe_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, exe_path)
-        print_ok(f"Created: {exe_path}  (copied from {src})")
-        return True
-    except PermissionError:
-        print_warn(f"Access denied creating: {exe_path}")
-        retry_elevated = input(
-            f"  {BOLD}Retry with administrator privileges? [y/N]: {RESET}"
-        ).strip().lower()
-        if retry_elevated in ("y", "yes", "д", "да"):
-            # For the exe, we just copy a file — use the elevated file write mechanism
-            # Read pythonw.exe binary content, then write it elevated
-            src = find_pythonw()
-            binary_content = src.read_bytes()
-            # Write to a temp .tmp file, then elevate-copy to target
-            return write_extra_file_elevated(exe_path, binary_content)
-        print_warn("Exe creation skipped.")
-        return False
+        subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-Command",
+                f'Start-Process cmd -Verb RunAs -WindowStyle Hidden -Wait -ArgumentList \'/c "{bat_path}"\'',
+            ],
+            check=True,
+            timeout=30,
+        )
+        return dst.exists()
     except Exception as e:
-        print_err(f"Failed to create file: {e}")
+        print_err(f"Elevated copy failed: {e}")
         return False
+    finally:
+        try:
+            if os.path.exists(bat_path):
+                os.unlink(bat_path)
+        except Exception:
+            pass
+
+
+def _elevated_mkdir(dir_path: Path) -> bool:
+    """Create a directory tree using elevated cmd.exe (bypasses access denied)."""
+    bat = tempfile.NamedTemporaryFile(mode="w", suffix=".bat", delete=False, encoding="utf-8")
+    bat.write(
+        '@echo off\n'
+        f'if not exist "{dir_path}" mkdir "{dir_path}"\n'
+        f'del /f /q "%~f0" >nul 2>&1\n'
+    )
+    bat_path = bat.name
+    bat.close()
+    try:
+        subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-Command",
+                f'Start-Process cmd -Verb RunAs -WindowStyle Hidden -Wait -ArgumentList \'/c "{bat_path}"\'',
+            ],
+            check=True,
+            timeout=30,
+        )
+        return dir_path.exists()
+    except Exception as e:
+        print_err(f"Failed to create directories: {e}")
+        return False
+    finally:
+        try:
+            if os.path.exists(bat_path):
+                os.unlink(bat_path)
+        except Exception:
+            pass
+
+
+def create_fake_exe(exe_path: Path, for_gui: bool = False) -> bool:
+    """Copy pythonw.exe to the target path (creates any needed directories).
+    
+    Uses elevated cmd.exe for system-protected directories (e.g. Program Files).
+    """
+    src = find_pythonw()
+
+    # For absolute paths in system-protected directories, go straight to elevated mode
+    is_abs_protected = exe_path.is_absolute() and any(
+        p in str(exe_path).lower() for p in ["program files", "programfiles"]
+    )
+
+    print_warn(f"Elevated creation required for: {exe_path}")
+    _elevated_mkdir(exe_path.parent)
+    print_step("🔨", f"Copying {exe_path.name} via elevated cmd (UAC prompt) …")
+    success = _elevated_copy_file(src, exe_path)
+    if success:
+        print_ok(f"Created: {exe_path}  (elevated copy from {src})")
+        return True
+    # If elevated copy also failed, try the fallback: simply copy through temp + write_extra_file_elevated
+    print_warn("Elevated cmd copy failed, trying PowerShell fallback …")
+    with open(src, "rb") as f:
+        binary = f.read()
+    return write_extra_file_elevated(exe_path, binary)
 
 
 def kill_process(proc: subprocess.Popen):
