@@ -176,7 +176,7 @@ def create_quest_window_script(
 def print_banner():
     print(f"""
 {CYAN}{BOLD}╔══════════════════════════════════════════════╗
-║     Discord Quest Completer  v1.1            ║
+║     Discord Quest Completer  v1.2            ║
 ║     by Baconana-chan                         ║
 ╚══════════════════════════════════════════════╝{RESET}
 """)
@@ -262,6 +262,158 @@ def resolve_exe_path(raw_name: str, base_dir: Path) -> Path:
     return base_dir.joinpath(*parts)
 
 
+def resolve_extra_path(raw_path: str, base_dir: Path) -> Path:
+    expanded = os.path.expandvars(raw_path.strip())
+    path = Path(expanded)
+    if not path.is_absolute():
+        path = base_dir / path
+    return path
+
+
+def read_multiline_content() -> str:
+    print(f"  {DIM}Enter file content. Finish with a line containing only END:{RESET}")
+    lines = []
+    while True:
+        line = input()
+        if line == "END":
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def write_extra_file_elevated(extra_path: Path, content: str | bytes) -> bool:
+    """Write a temporary file, then copy it via an elevated PowerShell process."""
+    # Write content to a temp file in a writable location first
+    if isinstance(content, str):
+        content_bytes = content.encode("utf-8")
+    else:
+        content_bytes = content
+    tmp_content = tempfile.NamedTemporaryFile(
+        mode="wb", suffix=".tmp", delete=False
+    )
+    tmp_content.write(content_bytes)
+    tmp_path = Path(tmp_content.name)
+    tmp_content.close()
+
+    # Build a self-contained PowerShell script that copies the temp file
+    ps_script = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".ps1", delete=False, encoding="utf-8"
+    )
+    target = str(extra_path)
+    source = str(tmp_path)
+    ps_script_path = Path(ps_script.name)
+    # Use single-quoted here-string at the top to avoid escaping content
+    ps_body = (
+        "$target = '" + target.replace("'", "''") + "'\n"
+        + "$source = '" + source.replace("'", "''") + "'\n"
+        + "$parent = [System.IO.Path]::GetDirectoryName($target)\n"
+        + "[System.IO.Directory]::CreateDirectory($parent) | Out-Null\n"
+        + "[System.IO.File]::Copy($source, $target, $true)\n"
+        + "Remove-Item -LiteralPath $source -Force\n"
+        + "Remove-Item -LiteralPath '" + str(ps_script_path).replace("'", "''") + "' -Force\n"
+    )
+    ps_script.write(ps_body)
+    ps_script.close()
+
+    # Create a tiny batch script that calls the PS1, then launch it elevated via cmd
+    bat_script = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".bat", delete=False, encoding="utf-8"
+    )
+    bat_script.write(
+        '@echo off\n'
+        f'powershell -NoProfile -ExecutionPolicy Bypass -File "{ps_script_path}"\n'
+        f'del /f /q "{ps_script_path}" >nul 2>&1\n'
+        f'del /f /q "%~f0" >nul 2>&1\n'
+    )
+    bat_path = bat_script.name
+    bat_script.close()
+
+    try:
+        subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-Command",
+                f'Start-Process cmd -Verb RunAs -WindowStyle Hidden -Wait -ArgumentList \'/c "{bat_path}"\'',
+            ],
+            check=True,
+            timeout=120,
+        )
+        if extra_path.exists():
+            print_ok(f"Created extra file (elevated): {extra_path}")
+            return True
+        print_err(f"Elevated write did not produce the target file.")
+        return False
+    except subprocess.TimeoutExpired:
+        print_err("Elevated process timed out (waited 120s).")
+        return False
+    except Exception as e:
+        print_err(f"Failed to create extra file with elevation: {e}")
+        return False
+    finally:
+        # Clean up temp files that may still exist
+        for leftover in (tmp_path, ps_script_path, bat_path):
+            try:
+                if os.path.exists(leftover):
+                    os.unlink(leftover)
+            except Exception:
+                pass
+
+
+def write_extra_file(extra_path: Path, content: str) -> bool:
+    try:
+        extra_path.parent.mkdir(parents=True, exist_ok=True)
+        extra_path.write_text(content, encoding="utf-8")
+        print_ok(f"Created extra file: {extra_path}")
+        return True
+    except PermissionError:
+        print_warn(f"Access denied to: {extra_path.parent}")
+        retry_elevated = input(
+            f"  {BOLD}Retry with administrator privileges? [y/N]: {RESET}"
+        ).strip().lower()
+        if retry_elevated in ("y", "yes", "д", "да"):
+            return write_extra_file_elevated(extra_path, content)
+        print_warn("Extra file skipped.")
+        return False
+    except Exception as e:
+        print_err(f"Failed to create extra file: {e}")
+        return False
+
+
+def create_extra_files(base_dir: Path) -> bool:
+    while True:
+        answer = input(
+            f"  {BOLD}Create extra file(s) required for Discord detection? [y/N]: {RESET}"
+        ).strip().lower()
+        if answer not in ("y", "yes", "д", "да"):
+            return True
+
+        raw_path = input(f"  {BOLD}Extra file path: {RESET}").strip()
+        if not raw_path:
+            print_warn("Extra file path cannot be empty.")
+            continue
+
+        extra_path = resolve_extra_path(raw_path, base_dir)
+        print_warn(f"Target path: {extra_path}")
+        confirm = input(f"  {BOLD}Confirm writing this file? [y/N]: {RESET}").strip().lower()
+        if confirm not in ("y", "yes", "д", "да"):
+            print_warn("Extra file skipped.")
+            continue
+
+        content = read_multiline_content()
+        if not write_extra_file(extra_path, content):
+            retry = input(f"  {BOLD}Try again? [y/N]: {RESET}").strip().lower()
+            if retry in ("y", "yes", "д", "да"):
+                continue
+            return False
+
+        more = input(f"  {BOLD}Add another extra file? [y/N]: {RESET}").strip().lower()
+        if more not in ("y", "yes", "д", "да"):
+            print_warn("Restart Discord after creating extra file(s), then launch the game.")
+            return True
+
+
 def create_fake_exe(exe_path: Path) -> bool:
     """Copy pythonw.exe to the target path (creates any needed directories)."""
     try:
@@ -270,6 +422,20 @@ def create_fake_exe(exe_path: Path) -> bool:
         shutil.copy2(src, exe_path)
         print_ok(f"Created: {exe_path}  (copied from {src})")
         return True
+    except PermissionError:
+        print_warn(f"Access denied creating: {exe_path}")
+        retry_elevated = input(
+            f"  {BOLD}Retry with administrator privileges? [y/N]: {RESET}"
+        ).strip().lower()
+        if retry_elevated in ("y", "yes", "д", "да"):
+            # For the exe, we just copy a file — use the elevated file write mechanism
+            # Read pythonw.exe binary content, then write it elevated
+            src = find_pythonw()
+            binary_content = src.read_bytes()
+            # Write to a temp .tmp file, then elevate-copy to target
+            return write_extra_file_elevated(exe_path, binary_content)
+        print_warn("Exe creation skipped.")
+        return False
     except Exception as e:
         print_err(f"Failed to create file: {e}")
         return False
@@ -352,7 +518,7 @@ class QuestRun:
 
 
 def print_session_help():
-    print(f"  {DIM}Controls: A add game, S status, Q stop all and quit, Ctrl+C stop all.{RESET}")
+    print(f"  {DIM}Controls: A add game, S status, V settings GUI, Q stop all and quit, Ctrl+C stop all.{RESET}")
 
 
 def read_console_key(timeout: float) -> Optional[str]:
@@ -488,6 +654,10 @@ def add_quest(apps: list[dict]) -> Optional[QuestRun]:
         shutil.rmtree(base_dir, ignore_errors=True)
         return None
 
+    if not create_extra_files(base_dir):
+        shutil.rmtree(base_dir, ignore_errors=True)
+        return None
+
     quest_seconds = duration_min * 60
     total_seconds = quest_seconds + DISCORD_DETECT_BUFFER
     deadline = datetime.now() + timedelta(seconds=total_seconds)
@@ -542,7 +712,7 @@ def run_session(apps: list[dict]) -> None:
             active = cleanup_finished(active)
 
             if not active:
-                print(f"\n  {DIM}No active quests. Press A to add a game, Q to quit.{RESET}")
+                print(f"\n  {DIM}No active quests. Press A to add a game, V for settings GUI, Q to quit.{RESET}")
                 while True:
                     key = read_console_key(0.2)
                     if key is None:
@@ -557,10 +727,15 @@ def run_session(apps: list[dict]) -> None:
                     if key == "q":
                         print_warn("Nothing to stop. Exiting.")
                         return
+                    if key == "v":
+                        print()
+                        print_step("⚙", "Opening settings GUI …")
+                        open_settings_gui(apps, active)
+                        break
                     if key in ("s", "h", "?"):
                         print_session_help()
                     else:
-                        print(f"  {DIM}Press A to add a game, Q to quit.{RESET}")
+                        print(f"  {DIM}Press A to add a game, V for settings GUI, Q to quit.{RESET}")
                 continue
 
             print_active_status(active)
@@ -584,6 +759,10 @@ def run_session(apps: list[dict]) -> None:
                     stop_all(active)
                     return
                 print_warn("Continuing active quests.")
+            elif key == "v":
+                print()
+                print_step("⚙", "Opening settings GUI …")
+                open_settings_gui(apps, active)
             elif key in ("h", "?"):
                 print_session_help()
             else:
@@ -592,6 +771,355 @@ def run_session(apps: list[dict]) -> None:
     except KeyboardInterrupt:
         print(f"\n\n  {YELLOW}Stopped by user.{RESET}")
         stop_all(active)
+
+
+# ─────────────────────────────────────────────────────────────
+# Settings GUI window (tkinter)
+# ─────────────────────────────────────────────────────────────
+def open_settings_gui(apps: list[dict], active_ref: list) -> None:
+    """
+    Open a tkinter window showing:
+      - searchable game list
+      - active quests with progress
+      - buttons: add quest, stop all, change default duration
+    Window is modal — console input is paused until the user closes it.
+    """
+    import tkinter as tk
+    from tkinter import ttk, simpledialog
+
+    window = tk.Tk()
+    window.title("⚙  Discord Quest — Settings")
+    window.geometry("720x560")
+    window.resizable(True, True)
+    window.configure(bg="#1e1e2e")
+
+    # ── Fonts & style ────────────────────────────────────────
+    font_title = ("Segoe UI", 12, "bold")
+    font_normal = ("Segoe UI", 10)
+    font_small = ("Segoe UI", 9)
+
+    # ── Top: active quests frame ─────────────────────────────
+    tk.Label(
+        window, text="Active Quests", font=font_title,
+        bg="#1e1e2e", fg="#cdd6f4"
+    ).pack(pady=(10, 2))
+
+    active_frame = tk.Frame(window, bg="#1e1e2e", relief="sunken", bd=1)
+    active_frame.pack(fill="x", padx=16, pady=(0, 8))
+
+    active_listbox = tk.Listbox(
+        active_frame, height=5, font=font_small,
+        bg="#313244", fg="#cdd6f4", selectbackground="#45475a",
+        selectforeground="#cdd6f4", relief="flat", borderwidth=0,
+    )
+    active_listbox.pack(fill="both", padx=4, pady=4, expand=True)
+
+    def refresh_active_display():
+        active_listbox.delete(0, tk.END)
+        for run in active_ref:
+            if run.completed:
+                status = f"✅ {run.name} — done ({format_seconds(int(run.elapsed))})"
+            elif run.early_exit or (run.proc.poll() is not None):
+                status = f"❌ {run.name} — stopped early"
+            elif run.elapsed <= DISCORD_DETECT_BUFFER:
+                pct = int(min(100, run.elapsed / DISCORD_DETECT_BUFFER * 100))
+                status = f"⏳ {run.name} — waiting for Discord {pct}%"
+            else:
+                qe = run.elapsed - DISCORD_DETECT_BUFFER
+                qr = run.quest_seconds - qe
+                pct = int(qe / run.quest_seconds * 100)
+                status = f"▶ {run.name} — {pct}% ({format_seconds(max(0, int(qr)))} left)"
+            active_listbox.insert(tk.END, status)
+        window.after(2000, refresh_active_display)
+
+    refresh_active_display()
+
+    # ── Separator ────────────────────────────────────────────
+    ttk.Separator(window, orient="horizontal").pack(fill="x", padx=16, pady=4)
+
+    # ── Search & add game ────────────────────────────────────
+    search_frame = tk.Frame(window, bg="#1e1e2e")
+    search_frame.pack(fill="x", padx=16, pady=(6, 2))
+
+    tk.Label(
+        search_frame, text="Find a game:", font=font_normal,
+        bg="#1e1e2e", fg="#a6adc8"
+    ).pack(side="left")
+
+    search_var = tk.StringVar()
+    search_entry = tk.Entry(
+        search_frame, textvariable=search_var, font=font_normal,
+        bg="#45475a", fg="#cdd6f4", insertbackground="#cdd6f4",
+        relief="flat", bd=6, width=40
+    )
+    search_entry.pack(side="left", padx=(8, 0))
+    search_entry.focus()
+
+    # ── Results listbox ──────────────────────────────────────
+    results_frame = tk.Frame(window, bg="#1e1e2e", relief="sunken", bd=1)
+    results_frame.pack(fill="both", padx=16, pady=(0, 6), expand=True)
+
+    results_listbox = tk.Listbox(
+        results_frame, height=8, font=font_small,
+        bg="#313244", fg="#cdd6f4", selectbackground="#89b4fa",
+        selectforeground="#1e1e2e", relief="flat", borderwidth=0,
+    )
+    results_listbox.pack(fill="both", padx=4, pady=4, expand=True)
+
+    results_data: list[dict] = []  # parallel to listbox entries
+
+    def do_search(*_):
+        query = search_var.get().strip().lower()
+        results_listbox.delete(0, tk.END)
+        results_data.clear()
+        if not query:
+            return
+        for app in apps:
+            name = app.get("name", "")
+            aliases = app.get("aliases", [])
+            all_names = [name] + (aliases if isinstance(aliases, list) else [])
+            if any(query in n.lower() for n in all_names):
+                results_listbox.insert(tk.END, name)
+                results_data.append(app)
+
+    search_var.trace_add("write", do_search)
+
+    # ── Config fields (inline, optional) ──────────────────────
+    config_frame = tk.LabelFrame(window, text="Quest Config (optional — defaults used if empty)",
+                                 font=font_small, bg="#1e1e2e",
+                                 fg="#a6adc8", padx=8, pady=4)
+    config_frame.pack(fill="x", padx=16, pady=(4, 2))
+
+    # Row 1: .exe path + duration
+    row1 = tk.Frame(config_frame, bg="#1e1e2e")
+    row1.pack(fill="x", pady=(4, 2))
+    tk.Label(row1, text="Executable path:", font=font_small,
+             bg="#1e1e2e", fg="#a6adc8").pack(side="left")
+    cfg_exe_var = tk.StringVar()
+    cfg_exe_entry = tk.Entry(row1, textvariable=cfg_exe_var, font=font_small,
+                             bg="#45475a", fg="#cdd6f4", insertbackground="#cdd6f4",
+                             relief="flat", bd=4)
+    cfg_exe_entry.pack(side="left", padx=(6, 16), fill="x", expand=True)
+    tk.Label(row1, text="Duration (min):", font=font_small,
+             bg="#1e1e2e", fg="#a6adc8").pack(side="left")
+    cfg_dur_var = tk.StringVar()
+    cfg_dur_entry = tk.Entry(row1, textvariable=cfg_dur_var, font=font_small,
+                             width=6, bg="#45475a", fg="#cdd6f4",
+                             insertbackground="#cdd6f4", relief="flat", bd=4)
+    cfg_dur_entry.pack(side="left", padx=(6, 0))
+
+    # Extra files: list of {"path": ..., "content": ...}
+    cfg_extra_files: list[dict] = []
+
+    extra_frame = tk.Frame(config_frame, bg="#1e1e2e")
+    extra_frame.pack(fill="x", pady=(2, 2))
+
+    def rebuild_extra_rows():
+        for w in extra_frame.winfo_children():
+            w.destroy()
+        for idx, ef in enumerate(cfg_extra_files):
+            row = tk.Frame(extra_frame, bg="#313244", bd=1, relief="solid")
+            row.pack(fill="x", pady=1, ipady=1)
+            # Path
+            pf = tk.Frame(row, bg="#313244")
+            pf.pack(fill="x", padx=4, pady=(2, 0))
+            tk.Label(pf, text="Extra path:", font=font_small,
+                     bg="#313244", fg="#a6adc8").pack(side="left")
+            pv = tk.StringVar(value=ef["path"])
+            pe = tk.Entry(pf, textvariable=pv, font=font_small,
+                          bg="#45475a", fg="#cdd6f4", insertbackground="#cdd6f4",
+                          relief="flat", bd=4)
+            pe.pack(side="left", padx=(6, 0), fill="x", expand=True)
+            # Content
+            cf = tk.Frame(row, bg="#313244")
+            cf.pack(fill="x", padx=4, pady=(1, 2))
+            tk.Label(cf, text="Content:", font=font_small,
+                     bg="#313244", fg="#a6adc8").pack(side="left", anchor="n")
+            ct = tk.Text(cf, height=3, font=font_small,
+                         bg="#45475a", fg="#cdd6f4", insertbackground="#cdd6f4",
+                         relief="flat", bd=4, wrap="word")
+            ct.pack(side="left", padx=(6, 0), fill="x", expand=True)
+            ct.insert("1.0", ef["content"])
+            # Updater
+            def upd(idx, pv, ct):
+                cfg_extra_files[idx]["path"] = pv.get()
+                cfg_extra_files[idx]["content"] = ct.get("1.0", "end-1c")
+            pv.trace_add("write", lambda *_, i=idx, p=pv, c=ct: upd(i, p, c))
+            ct.bind("<KeyRelease>", lambda e, i=idx, p=pv, c=ct: upd(i, p, c))
+            # Delete
+            def dlt(i):
+                cfg_extra_files.pop(i)
+                rebuild_extra_rows()
+            tk.Button(row, text="✕", command=lambda i=idx: dlt(i),
+                      font=font_small, bg="#f38ba8", fg="#1e1e2e",
+                      activebackground="#e64553", activeforeground="#1e1e2e",
+                      relief="flat", bd=0, padx=6, pady=1, cursor="hand2"
+                      ).pack(side="right", anchor="ne", padx=(4, 4), pady=(2, 0))
+
+    tk.Button(config_frame, text="+ Add extra file", font=font_small,
+              bg="#45475a", fg="#a6e3a1", activebackground="#313244",
+              activeforeground="#a6e3a1", relief="flat", padx=10, pady=2,
+              cursor="hand2", bd=0,
+              command=lambda: (cfg_extra_files.append({"path": "", "content": ""}),
+                               rebuild_extra_rows())
+              ).pack(pady=(0, 4), anchor="w")
+
+    # ── Buttons row ──────────────────────────────────────────
+    btn_frame = tk.Frame(window, bg="#1e1e2e")
+    btn_frame.pack(fill="x", padx=16, pady=(0, 10))
+
+    def on_add_selected():
+        sel = results_listbox.curselection()
+        if not sel:
+            print_warn("Select a game from the list first.")
+            return
+        app = results_data[sel[0]]
+
+        # Read config fields (optional)
+        chosen_exe = cfg_exe_var.get().strip()
+        if not chosen_exe:
+            api_paths = get_exe_paths(app)
+            if api_paths:
+                chosen_exe = api_paths[0]
+            else:
+                chosen_exe = app.get("name", "game.exe")
+
+        dur_raw = cfg_dur_var.get().strip()
+        try:
+            duration_min = int(dur_raw) if dur_raw else DEFAULT_DURATION
+            if duration_min <= 0:
+                raise ValueError
+        except ValueError:
+            duration_min = DEFAULT_DURATION
+
+        extra_files = list(cfg_extra_files)
+
+        # Detect if the executable path is absolute (drive letter or %VAR%)
+        absolute_candidate = resolve_extra_path(chosen_exe, Path("."))
+
+        if absolute_candidate.is_absolute():
+            # Absolute path: create exe directly at the target location
+            exe_path = absolute_candidate
+            # Helper scripts & signal go into a temp dir for easy cleanup
+            cleanup_base = Path(tempfile.mkdtemp(prefix="discord_quest_"))
+            helper_dir = cleanup_base
+        else:
+            # Relative path: create everything in a temp dir
+            cleanup_base = Path(tempfile.mkdtemp(prefix="discord_quest_"))
+            helper_dir = cleanup_base
+            exe_path = resolve_exe_path(chosen_exe, cleanup_base)
+
+        if not create_fake_exe(exe_path):
+            shutil.rmtree(cleanup_base, ignore_errors=True)
+            return
+
+        helper_script = helper_dir / "_quest_helper.pyw"
+        signal_file = helper_dir / "_adjust.txt"
+
+        # Write extra files (resolve_extra_path expands %VAR% and handles absolute)
+        for ef in extra_files:
+            if ef["path"]:
+                extra_p = resolve_extra_path(ef["path"], helper_dir)
+                write_extra_file(extra_p, ef["content"])
+
+        quest_seconds = duration_min * 60
+        total_seconds = quest_seconds + DISCORD_DETECT_BUFFER
+
+        game_display_name = app.get("name", exe_path.stem)
+        create_quest_window_script(helper_script, game_display_name, total_seconds, signal_file)
+
+        proc = subprocess.Popen(
+            [str(exe_path), str(helper_script), str(total_seconds)],
+            cwd=str(helper_dir),
+        )
+        run = QuestRun(
+            name=game_display_name,
+            exe_name=exe_path.name,
+            base_dir=cleanup_base,
+            proc=proc,
+            quest_seconds=quest_seconds,
+            total_seconds=total_seconds,
+            started_at=time.monotonic(),
+            signal_file=signal_file,
+        )
+        active_ref.append(run)
+        print_ok(f"Quest added via GUI: {game_display_name}")
+        do_search()
+
+    btn_add = tk.Button(
+        btn_frame, text="+ Add Selected Game", command=on_add_selected,
+        font=font_normal, bg="#89b4fa", fg="#1e1e2e",
+        activebackground="#74c7ec", activeforeground="#1e1e2e",
+        relief="flat", padx=12, pady=6, cursor="hand2", bd=0
+    )
+    btn_add.pack(side="left", padx=(0, 8))
+
+    def on_stop_all():
+        stop_all(active_ref)
+        window.destroy()
+
+    btn_stop = tk.Button(
+        btn_frame, text="⏹ Stop All", command=on_stop_all,
+        font=font_normal, bg="#f38ba8", fg="#1e1e2e",
+        activebackground="#e64553", activeforeground="#1e1e2e",
+        relief="flat", padx=12, pady=6, cursor="hand2", bd=0
+    )
+    btn_stop.pack(side="left", padx=(0, 8))
+
+    def on_close():
+        window.destroy()
+
+    btn_close = tk.Button(
+        btn_frame, text="✕ Close", command=on_close,
+        font=font_normal, bg="#45475a", fg="#a6adc8",
+        activebackground="#313244", activeforeground="#cdd6f4",
+        relief="flat", padx=12, pady=6, cursor="hand2", bd=0
+    )
+    btn_close.pack(side="right")
+
+    # ── Bottom: info ─────────────────────────────────────────
+    info_frame = tk.Frame(window, bg="#1e1e2e")
+    info_frame.pack(fill="x", padx=16, pady=(0, 8))
+
+    dur_default = tk.StringVar(value=str(DEFAULT_DURATION))
+    tk.Label(
+        info_frame, text="Default duration (min):", font=font_small,
+        bg="#1e1e2e", fg="#6c7086"
+    ).pack(side="left")
+    dur_entry = tk.Entry(
+        info_frame, textvariable=dur_default, font=font_small,
+        width=6, bg="#45475a", fg="#cdd6f4", insertbackground="#cdd6f4",
+        relief="flat", bd=4, justify="center"
+    )
+    dur_entry.pack(side="left", padx=(6, 12))
+
+    def on_dur_change():
+        global DEFAULT_DURATION
+        try:
+            v = int(dur_default.get())
+            if v > 0:
+                DEFAULT_DURATION = v
+                print_ok(f"Default duration set to {v} min")
+        except ValueError:
+            pass
+
+    tk.Button(
+        info_frame, text="Set", command=on_dur_change,
+        font=font_small, bg="#45475a", fg="#a6e3a1",
+        activebackground="#313244", activeforeground="#a6e3a1",
+        relief="flat", padx=10, pady=2, cursor="hand2", bd=0
+    ).pack(side="left")
+
+    tk.Label(
+        info_frame, text="(Press V again or ✕ Close to return to console)",
+        font=font_small, bg="#1e1e2e", fg="#585b70"
+    ).pack(side="right")
+
+    # Handle window close event
+    window.protocol("WM_DELETE_WINDOW", on_close)
+
+    # Block until the window is closed
+    window.mainloop()
 
 
 # ─────────────────────────────────────────────────────────────
