@@ -1,0 +1,48 @@
+name: Release build
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # The app has no package.json, but tauri-action installs a global
+      # @tauri-apps/cli itself. Node is preinstalled on the runner anyway,
+      # so this just guarantees a known-good npm.
+      #
+      # Note: a manual workflow_dispatch run only builds the app — with no
+      # releaseId the artifacts are not uploaded anywhere. Use it to sanity-
+      # check the build before cutting a release.
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: discord_quest_tauri/src-tauri
+
+      - name: Build and attach to release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Root of the Tauri project (contains src-tauri/tauri.conf.json)
+          projectPath: discord_quest_tauri
+          # Attach the built installer to the Release that triggered this run
+          releaseId: ${{ github.event.release.id }}
+          # No updater configured — skip the latest.json upload
+          includeUpdaterJson: false
