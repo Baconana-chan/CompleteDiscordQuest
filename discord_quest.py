@@ -208,12 +208,30 @@ def create_steam_manifest(
 # Backend: fake executable creation
 # ─────────────────────────────────────────────────────────────
 def find_pythonw() -> Path:
-    pythonw = Path(sys.executable).parent / "pythonw.exe"
-    if pythonw.exists():
-        return pythonw
+    # base_prefix first: Microsoft Store Python's sys.executable is an uncopyable app-execution alias
+    for pythonw in (Path(sys.base_prefix) / "pythonw.exe", Path(sys.executable).parent / "pythonw.exe"):
+        if pythonw.exists():
+            return pythonw
     raise FileNotFoundError(
         f"pythonw.exe not found next to {sys.executable}. "
         "Please reinstall Python."
+    )
+
+IS_STORE_PYTHON = "WindowsApps" in sys.base_prefix
+
+def prepare_store_runtime() -> None:
+    """Microsoft Store Python blocks DLL/Tcl loads from its package for outside processes.
+    Copy Tk bits to a real temp dir (LOCALAPPDATA writes are virtualized) and point children at them via env."""
+    base = Path(sys.base_prefix)
+    cache = Path(tempfile.gettempdir()) / "discord_quest_runtime"
+    if not (cache / "_tkinter.pyd").exists():
+        shutil.copytree(base / "tcl", cache / "tcl", dirs_exist_ok=True)
+        for n in ("tcl86t.dll", "tk86t.dll", "zlib1.dll", "_tkinter.pyd"):  # .pyd last = completion marker
+            shutil.copy2(base / "DLLs" / n, cache / n)
+    tcl = cache / "tcl"
+    os.environ.update(
+        PYTHONHOME=str(base), PYTHONPATH=str(cache),
+        TCL_LIBRARY=str(next(tcl.glob("tcl8.*[0-9]"))), TK_LIBRARY=str(next(tcl.glob("tk8.*[0-9]"))),
     )
 
 def resolve_exe_path(raw_name: str, base_dir: Path) -> Path:
@@ -491,11 +509,17 @@ def create_fake_exe(exe_path: Path, for_gui: bool = False) -> bool:
     copy, fixes the file ACL so the current non-elevated user can launch it.
     """
     src = find_pythonw()
+    # Store Python: the interpreter DLLs must sit next to the copied exe
+    dlls = [*src.parent.glob("python3*.dll"), *src.parent.glob("vcruntime*.dll")] if IS_STORE_PYTHON else []
+    if IS_STORE_PYTHON:
+        prepare_store_runtime()
 
     # Attempt a non-elevated copy first
     try:
         exe_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, exe_path)
+        for dll in dlls:
+            shutil.copy2(dll, exe_path.parent / dll.name)
         print_ok(f"Created: {exe_path}  (copy from {src})")
         return True
     except PermissionError:
@@ -508,6 +532,8 @@ def create_fake_exe(exe_path: Path, for_gui: bool = False) -> bool:
     print_step("🔨", f"Copying {exe_path.name} via elevated cmd (UAC prompt) …")
     success = _elevated_copy_file(src, exe_path)
     if success:
+        for dll in dlls:
+            _elevated_copy_file(dll, exe_path.parent / dll.name)
         # Fix ACL so the current user can execute without admin rights
         _grant_user_execute(exe_path)
         print_ok(f"Created: {exe_path}  (elevated copy from {src})")
